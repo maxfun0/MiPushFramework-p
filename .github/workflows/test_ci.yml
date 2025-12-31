@@ -10,86 +10,137 @@ permissions:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: set up JDK 11
+      with:
+        fetch-depth: 0  # 获取完整的 git 历史，用于版本号生成
+    
+    - name: Set up JDK 11
       uses: actions/setup-java@v4
       with:
         java-version: '11'
         distribution: 'temurin'
         cache: gradle
-
-    - name: Write key
+    
+    # 只有在需要签名时才设置签名信息
+    - name: Setup signing for release builds
+      if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
       run: |
         if [ ! -z "${{ secrets.SIGNING_KEY }}" ]; then
-          echo KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}' >> local.properties
-          echo KEYSTORE_ALIAS='${{ secrets.KEYSTORE_ALIAS }}' >> local.properties
-          echo KEY_PASSWORD='${{ secrets.KEY_PASSWORD }}' >> local.properties
-          echo KEY_LOCATE='../release.keystore' >> local.properties
-          echo ${{ secrets.SIGNING_KEY }} | base64 --decode > release.keystore
+          # 创建签名配置文件
+          cat > signing.properties << EOF
+          storeFile=../release.keystore
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.KEYSTORE_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+          
+          # 解码并保存密钥库
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > release.keystore
+          
+          # 验证密钥库
+          if [ -f release.keystore ]; then
+            echo "Keystore created successfully"
+            ls -la release.keystore
+          else
+            echo "Failed to create keystore"
+            exit 1
+          fi
         fi
-
-    - name: Git describe
-      id: ghd
-      uses: proudust/gh-describe@v2.1.0
-      with:
-        exclude: v*-*
-
+    
+    - name: Generate version name
+      id: version
+      run: |
+        # 获取最新标签或使用 commit hash
+        if git describe --tags --exact-match 2>/dev/null; then
+          VERSION=$(git describe --tags --exact-match)
+          echo "Using tag: $VERSION"
+        else
+          # 获取最近的标签和提交数
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          VERSION="${LATEST_TAG}-${COMMIT_COUNT}-${COMMIT_HASH}"
+          echo "Generated version: $VERSION"
+        fi
+        
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "VERSION_NAME=${VERSION}" >> $GITHUB_ENV
+    
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
+    
     - name: Build with Gradle
-      run: ./gradlew build -P versionName=${{ steps.ghd.outputs.describe }}
-
-
-
-    - name: Collect artifact name
+      env:
+        VERSION_NAME: ${{ steps.version.outputs.version }}
       run: |
-        for variant in vc105 normal; do
-          for build_type in debug release; do
-            artifact_name=$(basename -s .apk push/build/outputs/apk/$variant/$build_type/*.apk)
-            echo "${variant}_${build_type}_artifact=$artifact_name" >> $GITHUB_ENV
-          done
+        # 根据情况决定是否签名
+        if [ -f signing.properties ] && [ -f release.keystore ]; then
+          echo "Building with signing..."
+          ./gradlew build assembleRelease -PversionName=${VERSION_NAME}
+        else
+          echo "Building without signing..."
+          ./gradlew build -PversionName=${VERSION_NAME}
+        fi
+    
+    - name: Collect and verify APK files
+      run: |
+        # 查找所有 APK 文件
+        find push/build/outputs/apk -name "*.apk" -type f | while read apk_file; do
+          echo "Found APK: $apk_file"
+          
+          # 验证 APK 文件
+          if file "$apk_file" | grep -q "Zip archive"; then
+            echo "✓ $apk_file is a valid APK"
+          else
+            echo "✗ $apk_file is not a valid APK"
+          fi
+          
+          # 获取文件信息
+          filename=$(basename "$apk_file")
+          variant=$(echo "$apk_file" | grep -o "apk/[^/]*" | cut -d'/' -f2)
+          build_type=$(echo "$apk_file" | grep -o "apk/[^/]*/[^/]*" | cut -d'/' -f3)
+          
+          # 设置环境变量供后续步骤使用
+          if [[ "$build_type" == "release" ]]; then
+            echo "${variant}_release_apk=$apk_file" >> $GITHUB_ENV
+            echo "${variant}_release_name=$filename" >> $GITHUB_ENV
+          elif [[ "$build_type" == "debug" ]]; then
+            echo "${variant}_debug_apk=$apk_file" >> $GITHUB_ENV
+            echo "${variant}_debug_name=$filename" >> $GITHUB_ENV
+          fi
         done
-
-    - name: Upload Release For Normal
-      uses: actions/upload-artifact@v4.6.0
+        
+        # 检查是否有 APK 生成
+        if [ $(find push/build/outputs/apk -name "*.apk" -type f | wc -l) -eq 0 ]; then
+          echo "ERROR: No APK files found!"
+          ls -la push/build/outputs/apk/
+          exit 1
+        fi
+    
+    # 上传调试版本作为制品
+    - name: Upload Debug APKs as artifacts
+      uses: actions/upload-artifact@v4
       with:
-        name: ${{ env.normal_release_artifact }}
-        path: push/build/outputs/apk/normal/release/*.apk
-
-    - name: Upload Release For VC105
-      uses: actions/upload-artifact@v4.6.0
-      with:
-        name: ${{ env.vc105_release_artifact }}
-        path: push/build/outputs/apk/vc105/release/*.apk
-
-    - name: Upload Debug For Normal
-      uses: actions/upload-artifact@v4.6.0
-      with:
-        name: ${{ env.normal_debug_artifact }}
-        path: push/build/outputs/apk/normal/debug/*.apk
-
-    - name: Upload Debug For VC105
-      uses: actions/upload-artifact@v4.6.0
-      with:
-        name: ${{ env.vc105_debug_artifact }}
-        path: push/build/outputs/apk/vc105/debug/*.apk
-
-    - name: Get Version Name
-      id: gvn
-      run: |
-        artifact_name=(push/build/outputs/apk/*/*/*.apk)
-        version=$(echo $artifact_name | sed 's/.*(v.*)(-[^-]+){2}/\1/' -r)
-        echo "version=$version" >> $GITHUB_OUTPUT
-
-    - name: Release
+        name: debug-apks
+        path: |
+          push/build/outputs/apk/*/debug/*.apk
+        if-no-files-found: error
+    
+    # 只在特定条件下创建发布
+    - name: Create GitHub Release
+      if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        name: ${{ steps.gvn.outputs.version }}
-        tag_name: ${{ steps.gvn.outputs.version }}
-        target_commitish: ${{ steps.ghd.outputs.sha }}
+        name: Release ${{ steps.version.outputs.version }}
+        tag_name: ${{ steps.version.outputs.version }}
+        draft: false
         prerelease: true
-        files: push/build/outputs/apk/*/*/*.apk
+        generate_release_notes: true
+        files: |
+          push/build/outputs/apk/*/release/*.apk
+        fail_on_unmatched_files: true
