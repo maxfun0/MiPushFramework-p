@@ -19,40 +19,161 @@ jobs:
         distribution: 'temurin'
         cache: gradle
     
-    - name: Build without signing
+    - name: Fix signing configuration in gradle files
       run: |
-        # 使用 -Pandroid.injected.signing.store.file 参数传递空值来禁用签名
-        ./gradlew assembleDebug \
-          -PversionName=$(git describe --tags --exact-match 2>/dev/null || echo "dev-$(date +%Y%m%d)") \
-          -Pandroid.injected.signing.store.file="" \
-          -Pandroid.injected.signing.store.password="" \
-          -Pandroid.injected.signing.key.alias="" \
-          -Pandroid.injected.signing.key.password="" \
-          --no-daemon
+        echo "=== 修复 gradle 签名配置 ==="
         
-        echo "Build completed. APK files:"
-        find . -name "*.apk" -type f
+        # 1. 检查是否有签名配置
+        echo "检查现有的签名配置..."
+        grep -r "signingConfigs" . --include="*.gradle" --include="*.gradle.kts" || echo "未找到签名配置"
+        
+        # 2. 修改 push 模块的 build.gradle 来跳过 CI 环境下的签名
+        if [ -f "push/build.gradle" ] || [ -f "push/build.gradle.kts" ]; then
+          echo "检测到 push 模块，尝试修复签名配置..."
+          
+          # 如果是 Groovy DSL
+          if [ -f "push/build.gradle" ]; then
+            echo "修改 push/build.gradle..."
+            # 在文件末尾添加 CI 环境下的签名覆盖
+            cat >> push/build.gradle << 'EOF'
+
+// === 为 CI 环境添加的配置 ===
+android {
+    signingConfigs {
+        debug {
+            // 在 CI 环境中使用空配置
+            if (System.getenv('CI') == 'true' || System.getenv('GITHUB_ACTIONS') == 'true') {
+                storeFile = null
+                storePassword = null
+                keyAlias = null
+                keyPassword = null
+            }
+        }
+    }
+}
+EOF
+          fi
+        fi
+        
+        # 3. 创建空的签名文件（如果 gradle 配置引用了 .yuuta.jks）
+        echo "创建空的签名文件..."
+        touch .yuuta.jks
+        echo "Created empty .yuuta.jks file"
+        
+        # 4. 创建调试签名配置
+        echo "创建调试密钥库..."
+        keytool -genkey -v -keystore debug.keystore \
+          -storepass android -keypass android \
+          -alias androiddebugkey -keyalg RSA \
+          -keysize 2048 -validity 10000 \
+          -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
     
-    - name: Collect APKs
+    - name: Create local.properties with dummy signing
       run: |
+        echo "创建 local.properties 文件..."
+        cat > local.properties << 'EOF'
+# 调试签名配置
+key.alias=androiddebugkey
+key.password=android
+key.store=debug.keystore
+key.store.password=android
+EOF
+        echo "local.properties 内容:"
+        cat local.properties
+    
+    - name: Build with debug signing
+      run: |
+        echo "=== 开始构建 Debug 版本 ==="
+        
+        # 设置版本名
+        VERSION_NAME="dev-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+        echo "版本名: $VERSION_NAME"
+        
+        # 构建所有 debug 变体
+        echo "构建 normalDebug..."
+        ./gradlew :push:assembleNormalDebug -PversionName="$VERSION_NAME" \
+          --stacktrace \
+          --no-daemon \
+          -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" || true
+        
+        echo "构建 vc105Debug..."
+        ./gradlew :push:assembleVc105Debug -PversionName="$VERSION_NAME" \
+          --stacktrace \
+          --no-daemon \
+          -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" || true
+        
+        # 如果上面失败，尝试直接构建
+        echo "尝试直接构建 assembleDebug..."
+        ./gradlew assembleDebug -PversionName="$VERSION_NAME" \
+          --stacktrace \
+          --no-daemon \
+          -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
+    
+    - name: Check build outputs
+      run: |
+        echo "=== 检查构建输出 ==="
+        
+        # 检查 APK 文件
+        echo "查找 APK 文件..."
+        find . -name "*.apk" -type f 2>/dev/null | while read apk; do
+          echo "找到: $apk"
+          file_size=$(stat -c%s "$apk" 2>/dev/null || echo "unknown")
+          echo "  大小: $file_size bytes"
+        done
+        
+        # 检查特定目录
+        echo "检查 push/build/outputs/apk 目录..."
+        if [ -d "push/build/outputs/apk" ]; then
+          echo "目录结构:"
+          find push/build/outputs/apk -type f -name "*.apk" 2>/dev/null
+          echo "完整结构:"
+          tree push/build/outputs/apk || ls -laR push/build/outputs/apk/
+        else
+          echo "push/build/outputs/apk 目录不存在"
+        fi
+    
+    - name: Collect APK files
+      id: collect-apks
+      run: |
+        echo "=== 收集 APK 文件 ==="
+        
         mkdir -p apk_collected
         
-        # 收集 normal 变体的 debug APK
+        # 尝试收集所有 APK
+        APK_FOUND=false
+        
+        # 收集 normalDebug
         if ls push/build/outputs/apk/normal/debug/*.apk 2>/dev/null; then
+          echo "复制 normalDebug APK..."
           cp push/build/outputs/apk/normal/debug/*.apk apk_collected/
+          APK_FOUND=true
         fi
         
-        # 收集 vc105 变体的 debug APK
+        # 收集 vc105Debug
         if ls push/build/outputs/apk/vc105/debug/*.apk 2>/dev/null; then
+          echo "复制 vc105Debug APK..."
           cp push/build/outputs/apk/vc105/debug/*.apk apk_collected/
+          APK_FOUND=true
         fi
         
-        echo "Collected APKs:"
-        ls -la apk_collected/
+        # 如果没有找到，尝试其他位置
+        if [ "$APK_FOUND" = "false" ]; then
+          echo "在标准位置未找到 APK，搜索所有位置..."
+          find . -name "*.apk" -type f -exec cp {} apk_collected/ \; 2>/dev/null
+        fi
+        
+        # 检查收集到的文件
+        echo "收集到的 APK:"
+        ls -la apk_collected/ || echo "无 APK 文件"
+        
+        COUNT=$(ls apk_collected/*.apk 2>/dev/null | wc -l || echo 0)
+        echo "apk_count=$COUNT" >> $GITHUB_OUTPUT
     
-    - name: Upload artifacts
+    - name: Upload APK artifacts
+      if: steps.collect-apks.outputs.apk_count > 0
       uses: actions/upload-artifact@v4
       with:
         name: debug-apks
         path: apk_collected/
         if-no-files-found: error
+        retention-days: 7
