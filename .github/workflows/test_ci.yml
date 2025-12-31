@@ -19,46 +19,40 @@ jobs:
         distribution: 'temurin'
         cache: gradle
     
-    - name: Get version from git
-      id: get-version
+    - name: Build without signing
       run: |
-        # 获取版本信息
-        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-        COMMIT_COUNT=$(git rev-list --count HEAD)
-        COMMIT_HASH=$(git rev-parse --short HEAD)
-        VERSION="${LATEST_TAG}-${COMMIT_COUNT}-${COMMIT_HASH}"
-        echo "Version: $VERSION"
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        # 使用 -Pandroid.injected.signing.store.file 参数传递空值来禁用签名
+        ./gradlew assembleDebug \
+          -PversionName=$(git describe --tags --exact-match 2>/dev/null || echo "dev-$(date +%Y%m%d)") \
+          -Pandroid.injected.signing.store.file="" \
+          -Pandroid.injected.signing.store.password="" \
+          -Pandroid.injected.signing.key.alias="" \
+          -Pandroid.injected.signing.key.password="" \
+          --no-daemon
+        
+        echo "Build completed. APK files:"
+        find . -name "*.apk" -type f
     
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-    
-    - name: Build Debug versions only
+    - name: Collect APKs
       run: |
-        echo "Building Debug versions..."
-        ./gradlew assembleDebug -PversionName=${{ steps.get-version.outputs.version }}
+        mkdir -p apk_collected
         
-        echo "Build completed. Looking for APK files..."
-        
-        # 直接查找 push 模块的 debug APK
-        if [ -d "push/build/outputs/apk" ]; then
-          echo "Found push module APKs:"
-          find push/build/outputs/apk -name "*.apk" -type f
-          
-          # 复制到统一目录
-          mkdir -p debug_apks
-          find push/build/outputs/apk -name "*debug*.apk" -type f -exec cp {} debug_apks/ \;
-        else
-          echo "push/build/outputs/apk not found, searching all APKs..."
-          find . -name "*debug*.apk" -type f -exec cp {} debug_apks/ 2>/dev/null \;
+        # 收集 normal 变体的 debug APK
+        if ls push/build/outputs/apk/normal/debug/*.apk 2>/dev/null; then
+          cp push/build/outputs/apk/normal/debug/*.apk apk_collected/
         fi
         
-        echo "Debug APKs collected:"
-        ls -la debug_apks/ || echo "No debug APKs found"
+        # 收集 vc105 变体的 debug APK
+        if ls push/build/outputs/apk/vc105/debug/*.apk 2>/dev/null; then
+          cp push/build/outputs/apk/vc105/debug/*.apk apk_collected/
+        fi
+        
+        echo "Collected APKs:"
+        ls -la apk_collected/
     
-    - name: Upload Debug APKs
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: debug-apks
-        path: debug_apks/
-        if-no-files-found: warn
+        path: apk_collected/
+        if-no-files-found: error
