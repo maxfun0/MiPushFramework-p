@@ -5,17 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build:
+  build-debug:
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # 获取完整的 git 历史，用于版本号生成
     
     - name: Set up JDK 11
       uses: actions/setup-java@v4
@@ -24,123 +19,46 @@ jobs:
         distribution: 'temurin'
         cache: gradle
     
-    # 只有在需要签名时才设置签名信息
-    - name: Setup signing for release builds
-      if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    - name: Get version from git
+      id: get-version
       run: |
-        if [ ! -z "${{ secrets.SIGNING_KEY }}" ]; then
-          # 创建签名配置文件
-          cat > signing.properties << EOF
-          storeFile=../release.keystore
-          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.KEYSTORE_ALIAS }}
-          keyPassword=${{ secrets.KEY_PASSWORD }}
-          EOF
-          
-          # 解码并保存密钥库
-          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > release.keystore
-          
-          # 验证密钥库
-          if [ -f release.keystore ]; then
-            echo "Keystore created successfully"
-            ls -la release.keystore
-          else
-            echo "Failed to create keystore"
-            exit 1
-          fi
-        fi
-    
-    - name: Generate version name
-      id: version
-      run: |
-        # 获取最新标签或使用 commit hash
-        if git describe --tags --exact-match 2>/dev/null; then
-          VERSION=$(git describe --tags --exact-match)
-          echo "Using tag: $VERSION"
-        else
-          # 获取最近的标签和提交数
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          COMMIT_COUNT=$(git rev-list --count HEAD)
-          COMMIT_HASH=$(git rev-parse --short HEAD)
-          VERSION="${LATEST_TAG}-${COMMIT_COUNT}-${COMMIT_HASH}"
-          echo "Generated version: $VERSION"
-        fi
-        
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
-        echo "VERSION_NAME=${VERSION}" >> $GITHUB_ENV
+        # 获取版本信息
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        COMMIT_COUNT=$(git rev-list --count HEAD)
+        COMMIT_HASH=$(git rev-parse --short HEAD)
+        VERSION="${LATEST_TAG}-${COMMIT_COUNT}-${COMMIT_HASH}"
+        echo "Version: $VERSION"
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
     
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
     
-    - name: Build with Gradle
-      env:
-        VERSION_NAME: ${{ steps.version.outputs.version }}
+    - name: Build Debug versions only
       run: |
-        # 根据情况决定是否签名
-        if [ -f signing.properties ] && [ -f release.keystore ]; then
-          echo "Building with signing..."
-          ./gradlew build assembleRelease -PversionName=${VERSION_NAME}
-        else
-          echo "Building without signing..."
-          ./gradlew build -PversionName=${VERSION_NAME}
-        fi
-    
-    - name: Collect and verify APK files
-      run: |
-        # 查找所有 APK 文件
-        find push/build/outputs/apk -name "*.apk" -type f | while read apk_file; do
-          echo "Found APK: $apk_file"
-          
-          # 验证 APK 文件
-          if file "$apk_file" | grep -q "Zip archive"; then
-            echo "✓ $apk_file is a valid APK"
-          else
-            echo "✗ $apk_file is not a valid APK"
-          fi
-          
-          # 获取文件信息
-          filename=$(basename "$apk_file")
-          variant=$(echo "$apk_file" | grep -o "apk/[^/]*" | cut -d'/' -f2)
-          build_type=$(echo "$apk_file" | grep -o "apk/[^/]*/[^/]*" | cut -d'/' -f3)
-          
-          # 设置环境变量供后续步骤使用
-          if [[ "$build_type" == "release" ]]; then
-            echo "${variant}_release_apk=$apk_file" >> $GITHUB_ENV
-            echo "${variant}_release_name=$filename" >> $GITHUB_ENV
-          elif [[ "$build_type" == "debug" ]]; then
-            echo "${variant}_debug_apk=$apk_file" >> $GITHUB_ENV
-            echo "${variant}_debug_name=$filename" >> $GITHUB_ENV
-          fi
-        done
+        echo "Building Debug versions..."
+        ./gradlew assembleDebug -PversionName=${{ steps.get-version.outputs.version }}
         
-        # 检查是否有 APK 生成
-        if [ $(find push/build/outputs/apk -name "*.apk" -type f | wc -l) -eq 0 ]; then
-          echo "ERROR: No APK files found!"
-          ls -la push/build/outputs/apk/
-          exit 1
+        echo "Build completed. Looking for APK files..."
+        
+        # 直接查找 push 模块的 debug APK
+        if [ -d "push/build/outputs/apk" ]; then
+          echo "Found push module APKs:"
+          find push/build/outputs/apk -name "*.apk" -type f
+          
+          # 复制到统一目录
+          mkdir -p debug_apks
+          find push/build/outputs/apk -name "*debug*.apk" -type f -exec cp {} debug_apks/ \;
+        else
+          echo "push/build/outputs/apk not found, searching all APKs..."
+          find . -name "*debug*.apk" -type f -exec cp {} debug_apks/ 2>/dev/null \;
         fi
+        
+        echo "Debug APKs collected:"
+        ls -la debug_apks/ || echo "No debug APKs found"
     
-    # 上传调试版本作为制品
-    - name: Upload Debug APKs as artifacts
+    - name: Upload Debug APKs
       uses: actions/upload-artifact@v4
       with:
         name: debug-apks
-        path: |
-          push/build/outputs/apk/*/debug/*.apk
-        if-no-files-found: error
-    
-    # 只在特定条件下创建发布
-    - name: Create GitHub Release
-      if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        name: Release ${{ steps.version.outputs.version }}
-        tag_name: ${{ steps.version.outputs.version }}
-        draft: false
-        prerelease: true
-        generate_release_notes: true
-        files: |
-          push/build/outputs/apk/*/release/*.apk
-        fail_on_unmatched_files: true
+        path: debug_apks/
+        if-no-files-found: warn
