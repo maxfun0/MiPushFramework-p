@@ -67,11 +67,11 @@ jobs:
 
             # 创建 local.properties
             cat > local.properties << 'EOF'
-KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}
-KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }}
-KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}
-KEY_LOCATE=release.keystore
-EOF
+          KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }}
+          KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}
+          KEY_LOCATE=release.keystore
+          EOF
 
             echo "签名配置完成"
           else
