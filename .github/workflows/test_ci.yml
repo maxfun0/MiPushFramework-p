@@ -1,4 +1,4 @@
-name: Android Build
+name: Android Simple Build
 
 on:
   push:
@@ -17,13 +17,12 @@ jobs:
         with:
           java-version: '11'
           distribution: 'temurin'
-          cache: gradle
       
       - name: Create debug keystore
         run: |
           # 创建调试密钥库
           keytool -genkeypair -v \
-            -keystore debug.keystore \
+            -keystore .yuuta.jks \
             -alias androiddebugkey \
             -keyalg RSA \
             -keysize 2048 \
@@ -32,66 +31,60 @@ jobs:
             -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
           
-          # 复制为项目可能需要的文件名
-          cp debug.keystore .yuuta.jks
-          
-          echo "密钥库创建完成"
+          echo "密钥库创建完成:"
+          ls -la .yuuta.jks
       
       - name: Setup Gradle
         run: |
           chmod +x gradlew
-          # 显示Gradle版本
+          echo "Gradle版本:"
           ./gradlew --version
       
-      - name: Validate Gradle wrapper
+      - name: Clean project
         run: |
-          # 验证Gradle包装器
-          ./gradlew help
+          echo "清理项目..."
+          ./gradlew clean
       
-      - name: Build specific variant
+      - name: Try simple assemble
         run: |
-          echo "开始构建 vc105Debug 变体..."
+          echo "尝试简单构建命令..."
           
-          # 只构建特定的变体，减少复杂度
-          ./gradlew :push:assembleVc105Debug \
-            --no-daemon \
-            --no-parallel \
-            --stacktrace
+          # 尝试最基本的构建命令
+          ./gradlew assembleDebug 2>&1 | tee build.log
           
-          echo "构建完成"
+          # 检查是否成功
+          if [ $? -eq 0 ]; then
+            echo "构建成功！"
+          else
+            echo "构建失败，查看日志..."
+            tail -100 build.log
+            exit 1
+          fi
       
-      - name: Check build results
+      - name: Collect APKs
         if: success()
         run: |
-          echo "=== 检查构建结果 ==="
+          echo "收集APK文件..."
+          mkdir -p artifacts
           
-          # 检查push模块的APK
-          if [ -d "push/build/outputs/apk" ]; then
-            echo "APK目录内容:"
-            find push/build/outputs/apk -name "*.apk" -type f
-            echo ""
-            echo "复制APK文件..."
-            mkdir -p artifacts
-            find push/build/outputs/apk -name "*.apk" -type f -exec cp {} artifacts/ \;
-          fi
+          # 查找所有APK文件
+          find . -name "*.apk" -type f -exec cp {} artifacts/ \; 2>/dev/null || true
           
-          echo "=== 所有文件 ==="
-          ls -la artifacts/ 2>/dev/null || echo "artifacts目录不存在"
+          echo "找到的文件:"
+          ls -la artifacts/ || echo "没有找到APK文件"
       
-      - name: Upload APK artifacts
+      - name: Upload artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: android-apks
+          name: apk-files
           path: artifacts/
           retention-days: 7
       
-      - name: Upload build logs on failure
+      - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-failure-logs
-          path: |
-            **/build/reports/
-            **/build/outputs/logs/
+          name: build-log
+          path: build.log
           retention-days: 7
