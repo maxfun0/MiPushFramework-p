@@ -16,33 +16,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史
+          fetch-depth: 0
 
       - name: Generate version name
         id: version
         run: |
-          # 确保能获取到 tag（否则 describe 会报错）
           git fetch --tags || true
-
-          # 如果有标签就用标签，否则用提交哈希
+          
           if git describe --tags --exact-match >/dev/null 2>&1; then
             VERSION=$(git describe --tags --exact-match)
             echo "使用标签版本: $VERSION"
           else
-            # 获取最近的标签（如果有）
             LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
             COMMIT_COUNT=$(git rev-list --count HEAD)
             COMMIT_HASH=$(git rev-parse --short HEAD)
             DATE=$(date +%Y%m%d)
 
-            # 如果是 main/master 分支，用标签+提交数
             if [ "$GITHUB_REF" = "refs/heads/main" ] || [ "$GITHUB_REF" = "refs/heads/master" ]; then
               VERSION="${LATEST_TAG}-${COMMIT_COUNT}-${COMMIT_HASH}"
             else
-              # 其他分支用日期+提交哈希
               VERSION="dev-${DATE}-${COMMIT_HASH}"
             fi
-
             echo "生成版本: $VERSION"
           fi
 
@@ -58,35 +52,34 @@ jobs:
 
       - name: Setup signing
         run: |
-          # 只有在有签名密钥时才设置
-          if [ -n "${{ secrets.SIGNING_KEY }}" ]; then
-            echo "设置签名配置..."
-
-            # 解码密钥库
-            echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > release.keystore
-
+          # 优先使用项目配置的 .yuuta.jks
+          if [ -n "${{ secrets.YUUTA_JKS }}" ]; then
+            echo "使用 .yuuta.jks 签名文件..."
+            echo "${{ secrets.YUUTA_JKS }}" | base64 --decode > .yuuta.jks
+            
             # 创建 local.properties
             cat > local.properties << 'EOF'
-          KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}
-          KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }}
-          KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}
-          KEY_LOCATE=release.keystore
-          EOF
+KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}
+KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }}
+KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}
+KEY_LOCATE=.yuuta.jks
+EOF
+            
+            echo "签名配置完成"
+          elif [ -n "${{ secrets.SIGNING_KEY }}" ]; then
+            echo "使用 release.keystore..."
+            echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > release.keystore
 
+            cat > local.properties << 'EOF'
+KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}
+KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }}
+KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}
+KEY_LOCATE=release.keystore
+EOF
             echo "签名配置完成"
           else
             echo "未设置签名密钥，将使用调试签名"
-
-            # 创建调试密钥库
-            keytool -genkey -v \
-              -keystore debug.keystore \
-              -alias androiddebugkey \
-              -storepass android \
-              -keypass android \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
+            echo "DEBUG_BUILD=true" >> $GITHUB_ENV
           fi
 
       - name: Grant execute permission for gradlew
@@ -95,21 +88,29 @@ jobs:
       - name: Build with Gradle
         run: |
           echo "构建版本: ${{ steps.version.outputs.version }}"
-          ./gradlew build -P versionName=${{ steps.version.outputs.version }}
+          
+          # 如果没有签名配置，只构建调试版本
+          if [ -n "${{ env.DEBUG_BUILD }}" ]; then
+            echo "构建调试版本..."
+            ./gradlew assembleDebug -P versionName=${{ steps.version.outputs.version }}
+          else
+            echo "构建发布版本..."
+            ./gradlew build -P versionName=${{ steps.version.outputs.version }}
+          fi
 
       - name: Find and collect APKs
         id: find-apks
         run: |
           echo "查找 APK 文件..."
-
           mkdir -p apk_output
 
           APK_COUNT=0
+          # 查找所有APK文件（包括debug和release）
           while IFS= read -r apk_file; do
             echo "找到: $apk_file"
             cp "$apk_file" apk_output/
             APK_COUNT=$((APK_COUNT + 1))
-          done < <(find push/build/outputs/apk -name "*.apk" -type f 2>/dev/null)
+          done < <(find . -name "*.apk" -type f 2>/dev/null | head -20)
 
           if [ $APK_COUNT -eq 0 ]; then
             echo "未找到 APK 文件"
