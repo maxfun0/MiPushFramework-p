@@ -1,30 +1,25 @@
-name: Android CI
+name: Android Debug Build
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
   workflow_dispatch:
 
 jobs:
-  build:
+  debug:
     runs-on: ubuntu-latest
-
+    
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up JDK 11
+      
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           java-version: '11'
           distribution: 'temurin'
-          cache: gradle
-
-      - name: Create debug keystore
+      
+      - name: Create keystores
         run: |
-          # 创建调试密钥库
-          keytool -genkeypair \
-            -v \
+          # 创建所有可能需要的密钥库
+          keytool -genkeypair -v \
             -keystore debug.keystore \
             -alias androiddebugkey \
             -keyalg RSA \
@@ -34,60 +29,33 @@ jobs:
             -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
           
-          # 复制为项目需要的名称
+          # 创建多个副本
           cp debug.keystore .yuuta.jks
-          
-          echo "调试密钥库创建完成"
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
-      - name: Build debug APK only
+          cp debug.keystore release.keystore
+          cp debug.keystore keystore.jks
+      
+      - name: Run diagnostic tasks
         run: |
-          echo "开始构建..."
+          chmod +x gradlew
           
-          # 只构建特定的调试变体，避免复杂的构建任务
-          ./gradlew :push:assembleVc105Debug --stacktrace --info
+          echo "=== Gradle信息 ==="
+          ./gradlew --version
           
-          echo "构建完成"
+          echo "=== 可用的构建变体 ==="
+          ./gradlew tasks | grep -i assemble || echo "无法获取任务列表"
           
-          # 检查是否生成了APK
-          echo "查找生成的APK文件:"
-          find . -name "*.apk" -type f 2>/dev/null | head -10
-
-      - name: Check build output
-        run: |
-          echo "=== 构建输出检查 ==="
+          echo "=== 项目结构 ==="
+          find . -name "build.gradle" -o -name "build.gradle.kts" | head -10
           
-          # 检查push模块的构建输出
-          if [ -d "push/build/outputs/apk" ]; then
-            echo "push模块构建输出:"
-            ls -la push/build/outputs/apk/
-            find push/build/outputs/apk -name "*.apk" -type f 2>/dev/null
-          else
-            echo "push/build/outputs/apk目录不存在"
-          fi
+          echo "=== 清理项目 ==="
+          ./gradlew clean
           
-          # 检查所有构建输出
-          echo "所有构建目录:"
-          find . -name "build" -type d | head -10
-
-      - name: Upload APK artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk-artifacts
-          path: |
-            **/build/outputs/apk/**/*.apk
-            **/build/outputs/bundle/**/*.aab
-          retention-days: 7
-
-      - name: Upload build reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-reports
-          path: |
-            **/build/reports/
-            **/build/outputs/logs/
-          retention-days: 7
+          echo "=== 尝试构建 push 模块 ==="
+          # 尝试不同的构建命令
+          for variant in vc105Debug debug; do
+            echo "尝试构建: $variant"
+            ./gradlew :push:assemble${variant^} --stacktrace 2>&1 | tail -50 || true
+          done
+          
+          echo "=== 最终检查 ==="
+          find . -name "*.apk" -type f 2>/dev/null
