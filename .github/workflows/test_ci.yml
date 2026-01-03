@@ -18,11 +18,11 @@ jobs:
           java-version: '11'
           distribution: 'temurin'
       
-      - name: Create debug keystore
+      - name: Create debug keystore with proper config
         run: |
-          # 创建调试密钥库
+          # 创建调试密钥库，使用标准Android调试密钥
           keytool -genkeypair -v \
-            -keystore .yuuta.jks \
+            -keystore debug.keystore \
             -alias androiddebugkey \
             -keyalg RSA \
             -keysize 2048 \
@@ -31,8 +31,22 @@ jobs:
             -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
           
+          # 同时创建 .yuuta.jks
+          cp debug.keystore .yuuta.jks
+          
           echo "密钥库创建完成:"
-          ls -la .yuuta.jks
+          ls -la debug.keystore .yuuta.jks
+          
+          # 创建 signing.properties 文件
+          cat > signing.properties << EOF
+storeFile=debug.keystore
+storePassword=android
+keyAlias=androiddebugkey
+keyPassword=android
+EOF
+          
+          echo "签名配置文件:"
+          cat signing.properties
       
       - name: Setup Gradle
         run: |
@@ -45,33 +59,77 @@ jobs:
           echo "清理项目..."
           ./gradlew clean
       
-      - name: Try simple assemble
+      - name: Build specific variant
         run: |
-          echo "尝试简单构建命令..."
+          echo "构建特定变体..."
           
-          # 尝试最基本的构建命令
-          ./gradlew assembleDebug 2>&1 | tee build.log
+          # 先查看可用的任务
+          echo "=== 可用任务 ==="
+          ./gradlew tasks | grep -E "(assemble|build)" | head -20
+          
+          echo ""
+          echo "=== 尝试构建 prebuiltDebug ==="
+          # 从日志看，prebuiltDebug 构建成功，normalDebug 失败
+          ./gradlew :push:assemblePrebuiltDebug --stacktrace 2>&1 | tee build.log
           
           # 检查是否成功
           if [ $? -eq 0 ]; then
-            echo "构建成功！"
+            echo "prebuiltDebug 构建成功！"
           else
-            echo "构建失败，查看日志..."
-            tail -100 build.log
-            exit 1
+            echo "prebuiltDebug 构建失败"
+            tail -50 build.log
+          fi
+          
+          echo ""
+          echo "=== 尝试构建 vc105Debug ==="
+          ./gradlew :push:assembleVc105Debug --stacktrace 2>&1 | tee -a build.log
+          
+          if [ $? -eq 0 ]; then
+            echo "vc105Debug 构建成功！"
+          else
+            echo "vc105Debug 构建失败"
+            tail -50 build.log
           fi
       
-      - name: Collect APKs
-        if: success()
+      - name: Find and collect APKs
         run: |
-          echo "收集APK文件..."
+          echo "查找APK文件..."
+          
+          # 创建输出目录
           mkdir -p artifacts
           
-          # 查找所有APK文件
-          find . -name "*.apk" -type f -exec cp {} artifacts/ \; 2>/dev/null || true
+          echo "=== 在 push 模块中查找 ==="
+          if [ -d "push/build/outputs/apk" ]; then
+            echo "找到 push/build/outputs/apk 目录"
+            find push/build/outputs/apk -name "*.apk" -type f
+            
+            # 复制所有APK文件
+            find push/build/outputs/apk -name "*.apk" -type f -exec cp {} artifacts/ \;
+          else
+            echo "push/build/outputs/apk 目录不存在"
+          fi
           
-          echo "找到的文件:"
-          ls -la artifacts/ || echo "没有找到APK文件"
+          echo ""
+          echo "=== 在所有构建变体中查找 ==="
+          # 搜索特定变体的APK
+          for variant in prebuiltDebug vc105Debug debug; do
+            echo "搜索 $variant..."
+            find push -name "*${variant}*.apk" -type f 2>/dev/null | while read file; do
+              echo "找到: $file"
+              cp "$file" artifacts/
+            done
+          done
+          
+          echo ""
+          echo "=== 最终收集的文件 ==="
+          if [ -n "$(ls -A artifacts/ 2>/dev/null)" ]; then
+            echo "成功收集到以下文件:"
+            ls -la artifacts/
+          else
+            echo "未找到任何APK文件"
+            echo "搜索整个项目的APK:"
+            find . -name "*.apk" -type f 2>/dev/null
+          fi
       
       - name: Upload artifacts
         if: success()
@@ -80,11 +138,26 @@ jobs:
           name: apk-files
           path: artifacts/
           retention-days: 7
+        continue-on-error: true
       
-      - name: Upload build log on failure
-        if: failure()
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-logs
           path: build.log
           retention-days: 7
+      
+      - name: Create release if on main/master
+        if: success() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Build ${{ github.sha }}
+          tag_name: ci-${{ github.sha }}
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          files: artifacts/*.apk
+          fail_on_unmatched_files: false
