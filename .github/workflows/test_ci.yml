@@ -39,11 +39,11 @@ jobs:
           
           # 创建 signing.properties 文件
           cat > signing.properties << EOF
-storeFile=debug.keystore
-storePassword=android
-keyAlias=androiddebugkey
-keyPassword=android
-EOF
+          storeFile=debug.keystore
+          storePassword=android
+          keyAlias=androiddebugkey
+          keyPassword=android
+          EOF
           
           echo "签名配置文件:"
           cat signing.properties
